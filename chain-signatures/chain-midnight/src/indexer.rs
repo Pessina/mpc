@@ -3,6 +3,10 @@
 //! emissions. The source also returns the V1 proof-ready seed for the block, but the
 //! indexer currently discards it; persistence and independent verification come later.
 
+#[cfg(test)]
+#[path = "live_caller_test.rs"]
+mod live_caller_test;
+
 use crate::config::MidnightConfig;
 use crate::convert::generate_sign_request;
 use crate::emissions::{EmissionKind, SingletonCallEmissions};
@@ -254,18 +258,9 @@ impl<S: StateManager, T: ChainTelemetry> MidnightIndexer<S, T> {
         };
         let caller_hex = hex::encode(unpacked.caller_address);
 
-        // TODO: decide whether `caller_address` must be checked against the
-        // cross-contract-call initiator of the transaction that filed this notification.
-        // It is producer-supplied, so any contract can notify naming another, which
-        // triggers a signature over a record that contract filed. What that record says
-        // is already authenticated below: `resolve_verified_record` recomputes the
-        // request id and `generate_sign_request` requires `sender` to equal the address the
-        // record was read from. The exposure is therefore third-party triggering, not
-        // forgery, and the open question is whether that is worth gating. Gating it
-        // means joining each notification to the central call it came from through the
-        // claimed communication commitment, which the ledger validates for uniqueness
-        // and for corresponding to a real call.
-
+        // `emissions_in` authenticates the caller against the exact singleton call
+        // before the source discards transaction context. Its caller binding does
+        // not replace the stored-record hash and ledger-owner sender checks below.
         // Authority: the caller's own ledger at the SAME finalized hash the
         // notification was read at.
         let caller_tree = match source.contract_state_tree(&caller_hex, at_hash).await {
@@ -1212,6 +1207,57 @@ mod tests {
             assert_eq!(fields.get("tx_hash"), Some(&expected_tx_hash));
             assert_eq!(fields.get("sign_id"), Some(&expected_sign_id));
         }
+    }
+
+    #[tokio::test]
+    async fn caller_binding_rejects_before_reading_the_named_contract() {
+        use midnight_ledger_v9::structure::{ContractAction, Transaction};
+        use midnight_storage::storage::Array;
+
+        let mut tx: DecodedTransaction =
+            midnight_serialize::tagged_deserialize(&mut &CAPTURE_NOTIFY_TX[..]).unwrap();
+        let mut source = FixtureSource::default();
+        source.set_state_error(
+            hex_32(CAPTURE_CALLER),
+            CAPTURE_HEIGHT,
+            "caller state read reached",
+        );
+        source.set_emissions(
+            CAPTURE_HEIGHT,
+            emissions_in(&tx, &hex_32(CAPTURE_SINGLETON)).unwrap(),
+        );
+        let indexer = direct_indexer().await;
+        let block = block_ref(CAPTURE_HEIGHT);
+        let error = indexer.process_block(&source, &block).await.unwrap_err();
+        assert!(format!("{error:#}").contains("caller state read reached"));
+
+        let (segment, mut intent) = tx
+            .intents()
+            .find(|(_, intent)| {
+                intent
+                    .calls()
+                    .any(|call| call.entry_point.0 == b"signBidirectional")
+            })
+            .unwrap();
+        let callee = intent
+            .calls()
+            .find(|call| call.entry_point.0 == b"signBidirectional")
+            .unwrap()
+            .clone();
+        intent.actions = Array::new_from_slice(&[ContractAction::from(callee)]);
+        let Transaction::Standard(standard) = &mut tx else {
+            unreachable!()
+        };
+        standard.intents = standard.intents.insert(segment, intent);
+        source.set_emissions(
+            CAPTURE_HEIGHT,
+            emissions_in(&tx, &hex_32(CAPTURE_SINGLETON)).unwrap(),
+        );
+        assert!(indexer
+            .process_block(&source, &block)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

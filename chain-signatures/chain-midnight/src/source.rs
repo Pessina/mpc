@@ -46,6 +46,8 @@ pub(crate) enum ContractState {
 pub(crate) trait ChainSource: Send + Sync {
     async fn finalized_head(&self) -> anyhow::Result<BlockRef>;
     async fn block_at(&self, number: u64) -> anyhow::Result<BlockRef>;
+    /// Signing notifications have passed `emissions_in` caller authentication
+    /// against their exact call in the node-reported applied transaction.
     async fn block_emissions(
         &self,
         block: &BlockRef,

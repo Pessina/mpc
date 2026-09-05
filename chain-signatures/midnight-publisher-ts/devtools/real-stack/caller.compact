@@ -36,12 +36,12 @@ export circuit initialise(responseKey: Secp256k1Point): [] {
   mpcResponseKey = disclose(responseKey);
 }
 
-export circuit submitIsEvenRequest(
+circuit storeRequest(
   evmNonce: Uint<64>,
   keyVersion: Uint<8>,
   to: Bytes<20>,
   argWord: Bytes<32>
-): [] {
+): RequestId {
   const calldata = EvmCalldata<1> {
     selector: Bytes [0x2a, 0x2e, 0x13, 0x20],
     noWords: 1 as Uint<16>,
@@ -80,11 +80,46 @@ export circuit submitIsEvenRequest(
   assert(!requests.member(requestId), "Request already exists");
   requestNonce.increment(1);
   requests.insert(requestId, disclose(request));
+  return requestId;
+}
 
+export circuit storeIsEvenRequest(
+  evmNonce: Uint<64>,
+  keyVersion: Uint<8>,
+  to: Bytes<20>,
+  argWord: Bytes<32>
+): RequestId {
+  return storeRequest(evmNonce, keyVersion, to, argWord);
+}
+
+export circuit submitIsEvenRequest(
+  evmNonce: Uint<64>,
+  keyVersion: Uint<8>,
+  to: Bytes<20>,
+  argWord: Bytes<32>
+): [] {
+  notifyStoredRequest(storeRequest(evmNonce, keyVersion, to, argWord));
+}
+
+export circuit notifyStoredRequest(requestId: RequestId): [] {
+  assert(requests.member(disclose(requestId)), "Request not found");
   signetSigner.signBidirectional(
-    requestId,
+    disclose(requestId),
     constructSignBidirectionalEventNotificationV1(
       kernel.self(),
+      1 as Uint<8>,
+      [3, 0, 0, 0] as Vector<4, Uint<8>>,
+    ),
+  );
+}
+
+// This deliberately names the singleton instead of the linked caller.
+export circuit notifyWrongCaller(requestId: RequestId, singletonAddress: ContractAddress): [] {
+  assert(requests.member(disclose(requestId)), "Request not found");
+  signetSigner.signBidirectional(
+    disclose(requestId),
+    constructSignBidirectionalEventNotificationV1(
+      disclose(singletonAddress),
       1 as Uint<8>,
       [3, 0, 0, 0] as Vector<4, Uint<8>>,
     ),

@@ -148,6 +148,8 @@ fn emission_from_log_item(item: &VersionedLogItem<DefaultDB>) -> anyhow::Result<
     Ok(Emission { kind, payload })
 }
 
+/// Decode a call's raw emissions without authenticating its caller. Indexing uses
+/// [`emissions_in`], which has the transaction context needed for authentication.
 pub fn emissions_of_call<P: ProofKind<DefaultDB>>(
     call: &ContractCall<P, DefaultDB>,
 ) -> anyhow::Result<Vec<Emission>> {
@@ -161,6 +163,70 @@ pub fn emissions_of_call<P: ProofKind<DefaultDB>>(
         .collect()
 }
 
+fn verify_notification_caller(
+    tx: &DecodedTransaction,
+    segment: u16,
+    call_index: u32,
+    callee: &ContractCall<ProofMarker, DefaultDB>,
+    notification: &crate::records::SignBidirectionalEventNotification,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        callee.entry_point.0 == b"signBidirectional",
+        "notification emitted by a different entry point"
+    );
+    let key = (
+        callee.address,
+        callee.entry_point.ep_hash(),
+        callee.communication_commitment,
+    );
+    let mut callee_count = 0;
+    let mut claimant = None;
+    for (index, (caller_segment, caller)) in tx.calls().enumerate() {
+        if caller_segment != segment {
+            continue;
+        }
+        if (
+            caller.address,
+            caller.entry_point.ep_hash(),
+            caller.communication_commitment,
+        ) == key
+        {
+            callee_count += 1;
+        }
+        // `ContractCall::calls_with_seq` returns only the first match. Count the
+        // native claims across both phases so competing claims cannot be hidden.
+        for (transcript, guaranteed) in caller
+            .guaranteed_transcript
+            .iter()
+            .map(|t| (t, true))
+            .chain(caller.fallible_transcript.iter().map(|t| (t, false)))
+        {
+            for claim in transcript.effects.claimed_contract_calls.iter() {
+                let (_, address, entry_point, commitment) = claim.into_inner();
+                if (address, entry_point, commitment) == key {
+                    anyhow::ensure!(claimant.is_none(), "multiple claims for notification call");
+                    claimant = Some((index, caller.address, guaranteed));
+                }
+            }
+        }
+    }
+    anyhow::ensure!(callee_count == 1, "ambiguous notification callee identity");
+    let (index, address, guaranteed) = claimant.context("notification call has no caller claim")?;
+    anyhow::ensure!(
+        guaranteed && index < call_index as usize,
+        "caller claim has invalid phase or order"
+    );
+    anyhow::ensure!(
+        address.0 .0 == notification.payload[..32],
+        "notification names a different caller"
+    );
+    Ok(())
+}
+
+/// Extract from a proof-validated, applied transaction at the finalized-block boundary.
+/// The singleton circuit commits to its request ID and notification arguments and
+/// emits those same bytes; ledger proofs bind that commitment to this call's transcript.
+/// This filters caller claims, relying on the node's proof validation, not re-verifying it.
 pub fn emissions_in(
     tx: &DecodedTransaction,
     singleton: &[u8; 32],
@@ -168,15 +234,40 @@ pub fn emissions_in(
     tx.calls()
         .enumerate()
         .filter(|(_, (_, call))| call.address.0 .0 == *singleton)
-        .map(|(call_index, (_, call))| {
+        .map(|(call_index, (segment, call))| {
             let call_index = u32::try_from(call_index)
                 .context("transaction contains more calls than a u32 locator can represent")?;
             if call.fallible_transcript.is_some() {
                 return Err(anyhow::Error::new(UnsupportedFallibleCall { call_index }));
             }
+            let mut emissions = emissions_of_call(&call)?;
+            let emission_count = emissions.len();
+            emissions.retain(|emission| {
+                if emission.kind != EmissionKind::SignBidirectional {
+                    return true;
+                }
+                let notification = crate::reader::decode_notification(&emission.payload);
+                let verification = if emission_count != 1 {
+                    Err(anyhow::anyhow!(
+                        "signBidirectional must emit exactly one notification"
+                    ))
+                } else {
+                    verify_notification_caller(tx, segment, call_index, &call, &notification)
+                };
+                if let Err(error) = verification {
+                    tracing::warn!(
+                        reason = "notification-caller-unverified",
+                        call_index,
+                        request_id = %hex::encode(notification.request_id),
+                        "midnight notification dropped: {error:#}"
+                    );
+                    return false;
+                }
+                true
+            });
             Ok(SingletonCallEmissions {
                 call_index,
-                emissions: emissions_of_call(&call)?,
+                emissions,
             })
         })
         .collect()
@@ -323,6 +414,78 @@ mod tests {
         }
     }
 
+    fn captured_notify_calls() -> Vec<ContractCall<ProofMarker, DefaultDB>> {
+        let tx: DecodedTransaction =
+            midnight_serialize::tagged_deserialize(&mut &NOTIFY_TX_156[..]).unwrap();
+        let calls: Vec<_> = tx.calls().map(|(_, call)| call).collect();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].calls(&calls[1]));
+        calls
+    }
+
+    // These derivatives exercise structural rejection, not valid fresh proofs.
+    fn changed_notify(
+        edit: impl FnOnce(&mut Vec<ContractCall<ProofMarker, DefaultDB>>),
+    ) -> DecodedTransaction {
+        let mut calls = captured_notify_calls();
+        edit(&mut calls);
+        transaction(calls)
+    }
+
+    fn edit_claim(
+        caller: &mut ContractCall<ProofMarker, DefaultDB>,
+        edit: impl FnOnce(&mut midnight_onchain_runtime::context::ClaimedContractCallsValue),
+    ) {
+        let mut transcript = caller.guaranteed_transcript.as_deref().unwrap().clone();
+        assert_eq!(transcript.effects.claimed_contract_calls.size(), 1);
+        let mut claim = (**transcript
+            .effects
+            .claimed_contract_calls
+            .iter()
+            .next()
+            .unwrap())
+        .clone();
+        edit(&mut claim);
+        transcript.effects.claimed_contract_calls = Default::default();
+        transcript.effects.claimed_contract_calls =
+            transcript.effects.claimed_contract_calls.insert(claim);
+        caller.guaranteed_transcript = Some(Sp::new(transcript));
+    }
+
+    fn edit_captured_payload(
+        call: &mut ContractCall<ProofMarker, DefaultDB>,
+        edit: impl FnOnce(&mut [u8]),
+    ) {
+        let mut transcript = call.guaranteed_transcript.as_deref().unwrap().clone();
+        let mut program = Vec::from(&transcript.program);
+        let Op::Push {
+            value: StateValue::Array(event),
+            ..
+        } = &mut program[0]
+        else {
+            panic!("captured notification starts by pushing its event envelope");
+        };
+        let mut envelope = Vec::from(&*event);
+        let StateValue::Cell(cell) = &envelope[2] else {
+            panic!("captured Misc data cell")
+        };
+        let mut cell = (**cell).clone();
+        assert_eq!(cell.value.0.len(), 1);
+        assert_eq!(
+            cell.alignment.0.as_slice(),
+            &[AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 288 })]
+        );
+        let bytes = &mut cell.value.0[0].0;
+        bytes.resize(MISC_DATA_LEN, 0);
+        assert_eq!(&bytes[..MISC_NAME_LEN], &SIGN_BIDIRECTIONAL_EVENT);
+        edit(&mut bytes[MISC_NAME_LEN..]);
+        *bytes = trim(bytes);
+        envelope[2] = StateValue::from(cell);
+        *event = Array::new_from_slice(&envelope);
+        transcript.program = Array::new_from_slice(&program);
+        call.guaranteed_transcript = Some(Sp::new(transcript));
+    }
+
     #[test]
     fn decodes_each_singleton_event_kind() {
         for (name, expected) in [
@@ -348,6 +511,325 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn caller_binding_rejects_direct_singleton_notification() {
+        let captured: DecodedTransaction =
+            midnight_serialize::tagged_deserialize(&mut &NOTIFY_TX_156[..]).unwrap();
+        let singleton = hex_32(CAPTURE_SINGLETON);
+        let direct = transaction(
+            captured
+                .calls()
+                .map(|(_, call)| call)
+                .filter(|call| call.address.0 .0 == singleton)
+                .collect(),
+        );
+        let calls = emissions_in(&direct, &singleton).unwrap();
+        assert!(
+            calls
+                .iter()
+                .flat_map(|call| &call.emissions)
+                .all(|emission| { emission.kind != EmissionKind::SignBidirectional }),
+            "a direct singleton call must not authorize a signature request"
+        );
+    }
+
+    #[test]
+    fn caller_binding_rejects_duplicate_callee_identity() {
+        let captured: DecodedTransaction =
+            midnight_serialize::tagged_deserialize(&mut &NOTIFY_TX_156[..]).unwrap();
+        let mut calls: Vec<_> = captured.calls().map(|(_, call)| call).collect();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].calls(&calls[1]));
+        calls.push(calls[1].clone());
+        let decoded = emissions_in(&transaction(calls), &hex_32(CAPTURE_SINGLETON)).unwrap();
+        assert!(decoded.iter().all(|call| call.emissions.is_empty()));
+    }
+
+    #[test]
+    fn caller_binding_rejects_duplicate_claims_from_one_caller() {
+        let captured: DecodedTransaction =
+            midnight_serialize::tagged_deserialize(&mut &NOTIFY_TX_156[..]).unwrap();
+        let mut calls: Vec<_> = captured.calls().map(|(_, call)| call).collect();
+        let mut transcript = calls[0].guaranteed_transcript.as_deref().unwrap().clone();
+        let (seq, address, entry_point, commitment) = transcript
+            .effects
+            .claimed_contract_calls
+            .iter()
+            .next()
+            .unwrap()
+            .into_inner();
+        transcript.effects.claimed_contract_calls =
+            transcript.effects.claimed_contract_calls.insert(
+                midnight_onchain_runtime::context::ClaimedContractCallsValue::from_inner(
+                    seq + 1,
+                    address,
+                    entry_point,
+                    commitment,
+                ),
+            );
+        assert_eq!(transcript.effects.claimed_contract_calls.size(), 2);
+        calls[0].guaranteed_transcript = Some(Sp::new(transcript));
+        assert!(
+            calls[0].calls(&calls[1]),
+            "the first-match SDK helper hides ambiguity"
+        );
+        let decoded = emissions_in(&transaction(calls), &hex_32(CAPTURE_SINGLETON)).unwrap();
+        assert!(decoded.iter().all(|call| call.emissions.is_empty()));
+    }
+
+    #[test]
+    fn caller_binding_rejects_multiple_notifications_in_one_call() {
+        let captured: DecodedTransaction =
+            midnight_serialize::tagged_deserialize(&mut &NOTIFY_TX_156[..]).unwrap();
+        let mut calls: Vec<_> = captured.calls().map(|(_, call)| call).collect();
+        let mut transcript = calls[1].guaranteed_transcript.as_deref().unwrap().clone();
+        let program = Vec::from(&transcript.program);
+        transcript.program = Array::new_from_slice(&[program.clone(), program].concat());
+        calls[1].guaranteed_transcript = Some(Sp::new(transcript));
+        assert_eq!(emissions_of_call(&calls[1]).unwrap().len(), 2);
+        let decoded = emissions_in(&transaction(calls), &hex_32(CAPTURE_SINGLETON)).unwrap();
+        assert!(decoded.iter().all(|call| call.emissions.is_empty()));
+    }
+
+    #[test]
+    fn caller_binding_requires_the_exact_unique_guaranteed_predecessor() {
+        for (case, tx) in [
+            (
+                "mismatched caller",
+                changed_notify(|calls| calls[0].address.0 .0 = OTHER_CONTRACT),
+            ),
+            (
+                "unrelated named caller",
+                changed_notify(|calls| {
+                    let mut actual_caller = calls[0].clone();
+                    actual_caller.address.0 .0 = OTHER_CONTRACT;
+                    let mut transcript = calls[0].guaranteed_transcript.as_deref().unwrap().clone();
+                    transcript.effects.claimed_contract_calls = Default::default();
+                    calls[0].guaranteed_transcript = Some(Sp::new(transcript));
+                    calls.insert(0, actual_caller);
+                }),
+            ),
+            (
+                "wrong commitment",
+                changed_notify(|calls| {
+                    assert_ne!(calls[1].communication_commitment, Fr::from(1));
+                    calls[1].communication_commitment = Fr::from(1);
+                }),
+            ),
+            (
+                "wrong claimed callee",
+                changed_notify(|calls| {
+                    edit_claim(&mut calls[0], |claim| claim.1 .0 .0 = OTHER_CONTRACT)
+                }),
+            ),
+            (
+                "wrong claimed entry point",
+                changed_notify(|calls| {
+                    edit_claim(&mut calls[0], |claim| {
+                        claim.2 = EntryPointBuf(b"respond".to_vec()).ep_hash()
+                    })
+                }),
+            ),
+            (
+                "linked wrong entry point",
+                changed_notify(|calls| {
+                    calls[1].entry_point = EntryPointBuf(b"respond".to_vec());
+                    let ep = calls[1].entry_point.ep_hash();
+                    edit_claim(&mut calls[0], |claim| claim.2 = ep);
+                    assert!(calls[0].calls(&calls[1]));
+                }),
+            ),
+            (
+                "competing foreign claimant",
+                changed_notify(|calls| {
+                    let mut competitor = calls[0].clone();
+                    competitor.address.0 .0 = OTHER_CONTRACT;
+                    calls.insert(0, competitor);
+                }),
+            ),
+            (
+                "competing fallible claim",
+                changed_notify(|calls| {
+                    calls[0].fallible_transcript = calls[0].guaranteed_transcript.clone()
+                }),
+            ),
+            (
+                "fallible-only claim",
+                changed_notify(|calls| {
+                    calls[0].fallible_transcript = calls[0].guaranteed_transcript.take()
+                }),
+            ),
+            (
+                "caller after callee",
+                changed_notify(|calls| calls.swap(0, 1)),
+            ),
+            (
+                "missing claim",
+                changed_notify(|calls| calls[0].guaranteed_transcript = None),
+            ),
+            (
+                "notification names another caller",
+                changed_notify(|calls| {
+                    edit_captured_payload(&mut calls[1], |payload| payload[33] ^= 1)
+                }),
+            ),
+        ] {
+            let decoded = emissions_in(&tx, &hex_32(CAPTURE_SINGLETON)).unwrap();
+            assert_eq!(decoded.len(), 1, "{case}: still locates the singleton");
+            assert!(
+                decoded[0].emissions.is_empty(),
+                "{case}: must reject notification"
+            );
+        }
+    }
+
+    #[test]
+    fn caller_binding_does_not_join_across_intents() {
+        let mut calls = captured_notify_calls();
+        let callee = calls.pop().unwrap();
+        let Transaction::Standard(mut tx) = transaction(calls) else {
+            unreachable!()
+        };
+        let Transaction::Standard(other) = transaction(vec![callee]) else {
+            unreachable!()
+        };
+        tx.intents = tx
+            .intents
+            .insert(2, (*other.intents.get(&1).unwrap()).clone());
+        let decoded = emissions_in(&Transaction::Standard(tx), &hex_32(CAPTURE_SINGLETON)).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert!(decoded[0].emissions.is_empty());
+
+        let Transaction::Standard(mut tx) = transaction(captured_notify_calls()) else {
+            unreachable!()
+        };
+        tx.intents = tx.intents.insert(2, (*tx.intents.get(&1).unwrap()).clone());
+        let decoded = emissions_in(&Transaction::Standard(tx), &hex_32(CAPTURE_SINGLETON)).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].call_index, 1);
+        assert_eq!(decoded[1].call_index, 3);
+        assert_eq!(decoded[0].emissions.len(), 1);
+        assert_eq!(decoded[0].emissions, decoded[1].emissions);
+    }
+
+    #[test]
+    fn caller_binding_keeps_distinct_calls_and_response_locators_independent() {
+        let mut calls = captured_notify_calls();
+        let mut second = calls.clone();
+        second[1].communication_commitment = Fr::from(1);
+        edit_claim(&mut second[0], |claim| claim.3 = Fr::from(1));
+        edit_captured_payload(&mut second[1], |payload| payload[1] ^= 1);
+        let first_emissions = emissions_of_call(&calls[1]).unwrap();
+        let second_emissions = emissions_of_call(&second[1]).unwrap();
+        assert_ne!(first_emissions, second_emissions);
+        calls.extend(second);
+        let mut unlinked = calls[1].clone();
+        unlinked.communication_commitment = Fr::from(2);
+        calls.push(unlinked);
+        let response: DecodedTransaction =
+            midnight_serialize::tagged_deserialize(&mut &RESPOND_TX_161[..]).unwrap();
+        let response = response.calls().next().unwrap().1;
+        let response_emissions = emissions_of_call(&response).unwrap();
+        calls.push(response);
+        assert_eq!(
+            emissions_in(&transaction(calls), &hex_32(CAPTURE_SINGLETON)).unwrap(),
+            vec![
+                SingletonCallEmissions {
+                    call_index: 1,
+                    emissions: first_emissions
+                },
+                SingletonCallEmissions {
+                    call_index: 3,
+                    emissions: second_emissions
+                },
+                SingletonCallEmissions {
+                    call_index: 4,
+                    emissions: vec![]
+                },
+                SingletonCallEmissions {
+                    call_index: 5,
+                    emissions: response_emissions
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn captured_proof_binds_request_id_and_every_notification_argument() {
+        use midnight_transient_crypto::proofs::{VerifierKey, PARAMS_VERIFIER};
+
+        let captured: DecodedTransaction =
+            midnight_serialize::tagged_deserialize(&mut &NOTIFY_TX_156[..]).unwrap();
+        let (_, intent) = captured
+            .intents()
+            .find(|(_, intent)| {
+                intent
+                    .calls()
+                    .any(|call| call.entry_point.0 == b"signBidirectional")
+            })
+            .unwrap();
+        let callee = intent
+            .calls()
+            .find(|call| call.entry_point.0 == b"signBidirectional")
+            .unwrap();
+        let key: VerifierKey = midnight_serialize::tagged_deserialize(
+            &mut &include_bytes!("../fixtures/notify-signBidirectional.verifier")[..],
+        )
+        .unwrap();
+        let ProofVersioned::V3(proof) = &callee.proof else {
+            panic!("captured V3 proof")
+        };
+        let inputs = callee.public_inputs(intent.binding_commitment.clone().into());
+        // Call the cryptographic verifier directly: the ledger crate's optional
+        // proof-verifying feature is disabled in this integration.
+        key.verify(&PARAMS_VERIFIER, proof, inputs.clone().into_iter())
+            .unwrap();
+        for (case, offsets) in [
+            ("requestId", vec![1]),
+            ("version", vec![0]),
+            ("caller", vec![33]),
+            ("ledger path", vec![66]),
+            ("notification padding", vec![160]),
+            (
+                "entire notification",
+                std::iter::once(0).chain(33..161).collect(),
+            ),
+        ] {
+            let mut altered = callee.clone();
+            edit_captured_payload(&mut altered, |payload| {
+                for offset in &offsets {
+                    payload[*offset] ^= 1;
+                }
+            });
+            let changed = altered.public_inputs(intent.binding_commitment.clone().into());
+            assert_ne!(
+                emissions_of_call(&altered).unwrap(),
+                emissions_of_call(callee).unwrap(),
+                "{case}"
+            );
+            assert_ne!(
+                changed, inputs,
+                "{case}: mutation reaches the public transcript"
+            );
+            assert_eq!(changed[0], inputs[0], "{case}: binding input unchanged");
+            assert_eq!(
+                altered.communication_commitment,
+                callee.communication_commitment
+            );
+            assert!(
+                key.verify(&PARAMS_VERIFIER, proof, changed.into_iter())
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(
+                callee.public_inputs(intent.binding_commitment.clone().into()),
+                inputs
+            );
+        }
+        key.verify(&PARAMS_VERIFIER, proof, inputs.into_iter())
+            .unwrap();
     }
 
     #[test]

@@ -5,6 +5,7 @@ use alloy::providers::ext::AnvilApi as _;
 use alloy::providers::{Provider as _, ProviderBuilder};
 use anyhow::Context as _;
 use integration_tests::cluster;
+use integration_tests::midnight::{CallerNotification, FinalizedCallerTransaction};
 use mpc_chain_integration_core::utils::test::ChainIndexerStream;
 use mpc_chain_integration_core::{MockStateManager, NoopChainTelemetry};
 use mpc_chain_midnight::MidnightIndexer;
@@ -15,6 +16,50 @@ use test_log::test;
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(8 * 60);
 const RETURN_TRUE_RUNTIME_BYTECODE: &str = "600160005260206000f3";
+
+fn assert_applied(receipt: &FinalizedCallerTransaction, request_id: &[u8; 32]) {
+    assert_eq!(receipt.status, "SucceedEntirely");
+    assert_eq!(receipt.request_id, hex::encode(request_id));
+    assert!(!receipt.tx_id.is_empty());
+    assert!(!receipt.block_hash.is_empty());
+    tracing::info!(?receipt, "caller verification transaction finalized");
+}
+
+async fn assert_no_request_through(
+    events: &mut ChainIndexerStream,
+    request_id: [u8; 32],
+    height: u64,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        loop {
+            let event = events
+                .next_event()
+                .await
+                .context("Midnight stream closed")?;
+            match event {
+                ChainEvent::SignRequest { request, .. } => {
+                    anyhow::ensure!(
+                        request.id.request_id != request_id,
+                        "unauthenticated notification emitted SignRequest for {}",
+                        hex::encode(request_id)
+                    );
+                }
+                ChainEvent::Block(processed) if processed >= height => {
+                    tracing::info!(
+                        request_id = %hex::encode(request_id),
+                        height,
+                        processed,
+                        "caller rejection observation reached finalized processing"
+                    );
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("waiting for finalized caller rejection observation")?
+}
 
 async fn wait_for_completed_checkpoint(
     cluster: &cluster::Cluster,
@@ -83,9 +128,26 @@ async fn midnight_to_ethereum_to_midnight_consumes_caller_response() -> anyhow::
 
     let mut argument = [0; 32];
     argument[31] = 6;
-    midnight
-        .submit_is_even(0, target.into_array(), argument)
+    let stored = midnight
+        .store_is_even(0, target.into_array(), argument)
         .await?;
+    let stored_id: [u8; 32] = hex::decode(&stored.request_id)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("stored request ID is not 32 bytes"))?;
+    assert_applied(&stored, &stored_id);
+    assert_no_request_through(&mut events, stored_id, stored.block_height).await?;
+    for notification in [CallerNotification::Direct, CallerNotification::WrongCaller] {
+        let denied = midnight
+            .notify_request(notification, &stored.request_id)
+            .await?;
+        assert_applied(&denied, &stored_id);
+        assert_no_request_through(&mut events, stored_id, denied.block_height + 2).await?;
+        wait_for_completed_checkpoint(&cluster, stored_id, denied.block_height + 2).await?;
+    }
+    let linked = midnight
+        .notify_request(CallerNotification::Linked, &stored.request_id)
+        .await?;
+    assert_applied(&linked, &stored_id);
     let ChainEvent::SignRequest { request, .. } = events
         .wait_for(
             |event| {
@@ -93,6 +155,7 @@ async fn midnight_to_ethereum_to_midnight_consumes_caller_response() -> anyhow::
                     event,
                     ChainEvent::SignRequest { request, .. }
                         if request.chain == Chain::Midnight
+                            && request.id.request_id == stored_id
                             && matches!(request.kind, SignKind::SignBidirectional(_))
                 )
             },
@@ -128,6 +191,13 @@ async fn midnight_to_ethereum_to_midnight_consumes_caller_response() -> anyhow::
     assert_eq!(
         signed.unsigned_hash,
         format!("{:#x}", keccak256(&sign_event.serialized_transaction))
+    );
+    tracing::info!(
+        request_id = %hex::encode(request_id),
+        expected_sender = %expected_sender,
+        unsigned_hash = %signed.unsigned_hash,
+        signed_transaction = %signed.serialized,
+        "verified MPC signature for authenticated caller request"
     );
     let mut expected_input = hex::decode("2a2e1320")?;
     expected_input.extend_from_slice(&argument);

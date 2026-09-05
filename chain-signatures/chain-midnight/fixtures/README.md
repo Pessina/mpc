@@ -18,6 +18,14 @@ These files are not inclusion proofs. They pin the transcript and payload half o
 
 The indexer was used only as a capture aid to locate the three transaction heights. The production Rust read path does not query or trust the indexer.
 
+## Caller authentication evidence
+
+`notify-signBidirectional.verifier` is `package/dist/managed/keys/signBidirectional.verifier` from the published [`@sig-net/midnight-contract@0.20.0-rc.1` archive](https://registry.npmjs.org/@sig-net/midnight-contract/-/midnight-contract-0.20.0-rc.1.tgz), matching the notify capture's producer version. The archive SHA256 is `82893758f0b4ab28d387052010220452d6deb4129e9a5372832732f17e6be8e6`; the key SHA256 is `101ac368e366286272dbabd81ea7ca5c192e34fc69b7a3f5159d85054625214f`. This key verifies the captured singleton's V3 call proof through the pinned crypto crate's actual `VerifierKey::verify`.
+
+The caller-binding tests decode `notify-tx-156.mn` and retain its native call identities and claimed-call effects. Structural negative cases remove or alter decoded evidence; they are not freshly proven transactions. A separate cryptographic test verifies the original captured singleton proof, modifies the actual logged request ID or notification bytes on cloned transcripts, and requires proof verification to fail while the communication commitment and binding input remain unchanged. This tests captured-proof tampering; the compiled circuit's communication-commitment constraints provide the argument-binding rule for newly generated proofs.
+
+The production decoder only admits notifications with one exact same-intent callee identity and one matching guaranteed predecessor claim from the named caller. It relies on the finalized node's transaction-proof validation, and these fixtures do not independently prove block inclusion or identify a live deployment's verifier key. The historical notification still contains the legacy request ID noted in the indexer regression: caller authentication does not bypass the stored-record transient-hash check.
+
 ## Recapture procedure
 
 1. In `midnight-integration`, install Compact `0.33.0-rc.2`, compile the contracts, start the stack with `docker compose up -d`, and run `yarn test:integration-tests:signet-caller-evm-e2e` to exercise notify, respond, and respond-bidirectional against the 0.20 singleton.

@@ -11,6 +11,7 @@ import {
 } from "@midnight-ntwrk/midnight-js/types";
 import { httpClientProofProvider } from "@midnight-ntwrk/midnight-js-http-client-proof-provider";
 import type { WalletFacade } from "@midnightntwrk/wallet-sdk-facade";
+import type { SignetContractCircuitId, SignetContractProviders } from "@sig-net/midnight-contract";
 import {
   makeCompiledContract,
   signetContractManagedPath,
@@ -80,6 +81,33 @@ export function buildCallerProviders(
       config.proofServerUrl,
       new ZKConfigRegistry([callerZk, signetZk]),
     ),
+    walletProvider: wallet,
+    midnightProvider: wallet,
+  };
+}
+
+export function buildSignetProviders(
+  facade: WalletFacade,
+  keys: AccountKeys,
+  config: MidnightNodeConfig,
+  databasePath: string,
+): SignetContractProviders {
+  const zk = new NodeZkConfigProvider<SignetContractCircuitId>(signetContractManagedPath);
+  const wallet = walletProvider(facade, keys);
+  return {
+    privateStateProvider: levelPrivateStateProvider({
+      midnightDbName: databasePath,
+      privateStateStoreName: "signet-private-state",
+      signingKeyStoreName: "signet-signing-keys",
+      accountId: wallet.getCoinPublicKey(),
+      privateStoragePasswordProvider: () => "MpcRealStack#2026!",
+    }),
+    publicDataProvider: indexerPublicDataProvider({
+      queryURL: config.indexerUrl,
+      subscriptionURL: config.indexerWsUrl,
+    }),
+    zkConfigProvider: zk,
+    proofProvider: httpClientProofProvider(config.proofServerUrl, zk),
     walletProvider: wallet,
     midnightProvider: wallet,
   };

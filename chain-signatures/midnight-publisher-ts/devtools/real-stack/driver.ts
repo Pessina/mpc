@@ -1,11 +1,19 @@
 import { createInterface } from "node:readline";
+import { rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { findDeployedContract, type FoundContract } from "@midnight-ntwrk/midnight-js/contracts";
 import { setNetworkId } from "@midnight-ntwrk/midnight-js/network-id";
+import type { FinalizedTxData } from "@midnight-ntwrk/midnight-js/types";
+import {
+  SIGNET_CONTRACT_PRIVATE_STATE_ID,
+  type Contract as SignetContract,
+  type SignetContractPrivateState,
+} from "@sig-net/midnight-contract";
 import {
   assertRootFunded,
   buildDeployTransaction,
   contractAddressToReference,
+  createSignetContractPrivateState,
   deploySignetContract,
   deriveAccountKeys,
   fundChildFromRoot,
@@ -13,6 +21,7 @@ import {
   initialiseWalletFacade,
   isFeeReady,
   readAccountFunding,
+  signetContractCompiledContract,
   submitUnprovenTransaction,
   withSyncedWalletFacade,
   type MidnightNodeConfig,
@@ -21,6 +30,7 @@ import {
 import {
   parseRequestIdHex,
   parseSecp256k1PublicKey,
+  pureCircuits as signetPureCircuits,
   requestIdBytes,
   respondBidirectionalEventToCircuitInput,
   serializeRespondOutput,
@@ -33,6 +43,7 @@ import {
 import { ledger, pureCircuits, type Contract } from "./managed/caller/contract/index.js";
 import {
   buildCallerProviders,
+  buildSignetProviders,
   callerCompiledContract,
   CALLER_PRIVATE_STATE_ID,
 } from "./providers.js";
@@ -56,10 +67,15 @@ interface InitialiseRequest {
 }
 
 interface SubmitRequest {
-  op: "submitIsEven";
+  op: "submitIsEven" | "storeIsEven";
   nonce: string;
   target: string;
   argument: string;
+}
+
+interface NotifyRequest {
+  op: "notifyStoredRequest" | "notifyDirect" | "notifyWrongCaller";
+  requestId: string;
 }
 
 interface SignedTransactionRequest {
@@ -81,6 +97,7 @@ type Request =
   | BootstrapRequest
   | InitialiseRequest
   | SubmitRequest
+  | NotifyRequest
   | SignedTransactionRequest
   | SettleResponseRequest
   | ShutdownRequest;
@@ -89,6 +106,9 @@ interface Session {
   facade: WalletFacade;
   caller: CallerHandle;
   callerAddress: string;
+  central: FoundContract<SignetContract<SignetContractPrivateState>>;
+  centralAddress: string;
+  artifactDir: string;
   publicDataProvider: SignetPublicStateSource;
   reader: SignetRequestResponseReader;
   responseKey?: Secp256k1Point;
@@ -130,6 +150,31 @@ async function callerHasRequest(active: Session, requestId: RequestIdHex): Promi
   const state = await active.publicDataProvider.queryContractState(active.callerAddress);
   if (!state) throw new Error(`no caller state found at ${active.callerAddress}`);
   return ledger(state.data).requests.member(requestIdBytes(requestId));
+}
+
+async function phaseReceipt(
+  active: Session,
+  phase: "store" | "direct" | "wrong-caller" | "linked",
+  requestId: Uint8Array,
+  finalized: FinalizedTxData,
+) {
+  const receipt = {
+    requestId: Buffer.from(requestId).toString("hex"),
+    txId: finalized.txId,
+    blockHeight: finalized.blockHeight,
+    blockHash: finalized.blockHash,
+    status: finalized.status,
+  };
+  const evidence = {
+    ...receipt,
+    callerAddress: active.callerAddress,
+    centralAddress: active.centralAddress,
+  };
+  diagnostics(`finalized ${phase}`, JSON.stringify(evidence));
+  const path = join(active.artifactDir, `${phase}.json`);
+  await writeFile(`${path}.tmp`, `${JSON.stringify(evidence)}\n`);
+  await rename(`${path}.tmp`, path);
+  return receipt;
 }
 
 function deployEnv(config: MidnightNodeConfig, seed: string): Record<string, string> {
@@ -227,10 +272,27 @@ async function bootstrap(request: BootstrapRequest) {
     privateStateId: CALLER_PRIVATE_STATE_ID,
     initialPrivateState: createCallerPrivateState(deployerSecret),
   });
+  const centralHandle = await findDeployedContract(
+    buildSignetProviders(
+      facade,
+      invokerKeys,
+      request.config,
+      join(request.artifactDir, "signet.leveldb"),
+    ),
+    {
+      contractAddress: central.contractAddress,
+      compiledContract: signetContractCompiledContract,
+      privateStateId: SIGNET_CONTRACT_PRIVATE_STATE_ID,
+      initialPrivateState: createSignetContractPrivateState(),
+    },
+  );
   session = {
     facade,
     caller,
     callerAddress: callerDeployment.contractAddress,
+    central: centralHandle,
+    centralAddress: central.contractAddress,
+    artifactDir: request.artifactDir,
     publicDataProvider: providers.publicDataProvider,
     reader: new SignetRequestResponseReader({
       requesterContractAddress: callerDeployment.contractAddress,
@@ -270,7 +332,7 @@ async function dispatch(request: Request): Promise<unknown> {
     const transaction = await waitFor("a verified signed EVM transaction", () =>
       active.reader.getSignedEvmTransaction(requestId, request.expectedSigner),
     );
-    return {
+    const verified = {
       serialized: transaction.serialized,
       unsignedHash: transaction.unsignedHash,
       from: transaction.from,
@@ -278,6 +340,8 @@ async function dispatch(request: Request): Promise<unknown> {
       data: transaction.data,
       chainId: transaction.chainId.toString(),
     };
+    diagnostics("verified signed EVM transaction", JSON.stringify({ requestId, ...verified }));
+    return verified;
   }
   if (request.op === "settleResponse") {
     const responseKey = active.responseKey;
@@ -299,13 +363,56 @@ async function dispatch(request: Request): Promise<unknown> {
     );
     return {};
   }
-  await active.caller.callTx.submitIsEvenRequest(
-    BigInt(request.nonce),
-    1n,
-    bytes(request.target, 20),
-    bytes(request.argument, 32),
-  );
-  return {};
+  if (request.op === "notifyDirect") {
+    const requestId = requestIdBytes(parseRequestIdHex(request.requestId));
+    const result = await active.central.callTx.signBidirectional(
+      requestId,
+      signetPureCircuits.constructSignBidirectionalEventNotificationV1(
+        contractAddressToReference(active.callerAddress),
+        1n,
+        [3n, 0n, 0n, 0n],
+      ),
+    );
+    return phaseReceipt(active, "direct", requestId, result.public);
+  }
+  if (request.op === "notifyWrongCaller") {
+    const requestId = requestIdBytes(parseRequestIdHex(request.requestId));
+    const result = await active.caller.callTx.notifyWrongCaller(
+      requestId,
+      contractAddressToReference(active.centralAddress),
+    );
+    return phaseReceipt(active, "wrong-caller", requestId, result.public);
+  }
+  if (request.op === "notifyStoredRequest") {
+    const requestId = requestIdBytes(parseRequestIdHex(request.requestId));
+    const result = await active.caller.callTx.notifyStoredRequest(requestId);
+    return phaseReceipt(active, "linked", requestId, result.public);
+  }
+  if (request.op === "storeIsEven") {
+    const result = await active.caller.callTx.storeIsEvenRequest(
+      BigInt(request.nonce),
+      1n,
+      bytes(request.target, 20),
+      bytes(request.argument, 32),
+    );
+    const requestId = result.private.result;
+    if (
+      !(await callerHasRequest(active, parseRequestIdHex(Buffer.from(requestId).toString("hex"))))
+    ) {
+      throw new Error("finalized storage-only request is absent from the caller ledger");
+    }
+    return phaseReceipt(active, "store", requestId, result.public);
+  }
+  if (request.op === "submitIsEven") {
+    await active.caller.callTx.submitIsEvenRequest(
+      BigInt(request.nonce),
+      1n,
+      bytes(request.target, 20),
+      bytes(request.argument, 32),
+    );
+    return {};
+  }
+  throw new Error(`unsupported driver operation: ${request.op}`);
 }
 
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });

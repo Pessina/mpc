@@ -70,6 +70,22 @@ pub struct SignedEvmTransaction {
     pub chain_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinalizedCallerTransaction {
+    pub request_id: String,
+    pub tx_id: String,
+    pub block_height: u64,
+    pub block_hash: String,
+    pub status: String,
+}
+
+pub enum CallerNotification {
+    Direct,
+    WrongCaller,
+    Linked,
+}
+
 pub struct MidnightContext {
     _stack: MidnightStack,
     pub config: MidnightConfig,
@@ -152,6 +168,41 @@ impl MidnightContext {
             }))
             .await?;
         Ok(())
+    }
+
+    pub async fn store_is_even(
+        &self,
+        nonce: u64,
+        target: [u8; 20],
+        argument: [u8; 32],
+    ) -> anyhow::Result<FinalizedCallerTransaction> {
+        self.driver
+            .lock()
+            .await
+            .request(&serde_json::json!({
+                "op": "storeIsEven",
+                "nonce": nonce.to_string(),
+                "target": hex::encode(target),
+                "argument": hex::encode(argument),
+            }))
+            .await
+    }
+
+    pub async fn notify_request(
+        &self,
+        notification: CallerNotification,
+        request_id: &str,
+    ) -> anyhow::Result<FinalizedCallerTransaction> {
+        let op = match notification {
+            CallerNotification::Direct => "notifyDirect",
+            CallerNotification::WrongCaller => "notifyWrongCaller",
+            CallerNotification::Linked => "notifyStoredRequest",
+        };
+        self.driver
+            .lock()
+            .await
+            .request(&serde_json::json!({ "op": op, "requestId": request_id }))
+            .await
     }
 
     pub async fn signed_evm_transaction(
